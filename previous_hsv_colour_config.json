@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "colour_space": "HSV",
+  "reference_width": 1050,
+  "colours": {
+    "BLUE": {
+      "h_center": 94,
+      "h_tolerance": 5,
+      "s_center": 142,
+      "s_tolerance": 52,
+      "v_center": 216,
+      "v_tolerance": 52,
+      "min_area": 55,
+      "max_area": 4500,
+      "morph_kernel": 3
+    },
+    "CYAN": {
+      "h_center": 95,
+      "h_tolerance": 16,
+      "s_center": 116,
+      "s_tolerance": 47,
+      "v_center": 200,
+      "v_tolerance": 59,
+      "min_area": 1194,
+      "max_area": 1195,
+      "morph_kernel": 3
+    },
+    "GREEN": {
+      "h_center": 58,
+      "h_tolerance": 5,
+      "s_center": 85,
+      "s_tolerance": 23,
+      "v_center": 194,
+      "v_tolerance": 50,
+      "min_area": 861,
+      "max_area": 13600,
+      "morph_kernel": 2
+    },
+    "PURPLE": {
+      "h_center": 145,
+      "h_tolerance": 18,
+      "s_center": 145,
+      "s_tolerance": 105,
+      "v_center": 130,
+      "v_tolerance": 115,
+      "min_area": 55,
+      "max_area": 4500,
+      "morph_kernel": 3
+    },
+    "ORANGE": {
+      "h_center": 15,
+      "h_tolerance": 13,
+      "s_center": 175,
+      "s_tolerance": 80,
+      "v_center": 190,
+      "v_tolerance": 70,
+      "min_area": 55,
+      "max_area": 4500,
+      "morph_kernel": 3
+    },
+    "RED": {
+      "h_center": 178,
+      "h_tolerance": 8,
+      "s_center": 171,
+      "s_tolerance": 142,
+      "v_center": 187,
+      "v_tolerance": 28,
+      "min_area": 150,
+      "max_area": 11552,
+      "morph_kernel": 3
+    }
+  }
+}
