@@ -22,6 +22,11 @@ from auto_vision_gem_colors_v4_1 import (
 )
 
 
+# Auto sorting works through the whole field one colour at a time.  The route
+# cost is used only to choose the best stone within the current colour.
+AUTO_COLOUR_ORDER = ("CYAN", "GREEN", "PURPLE", "RED", "ORANGE", "BLUE")
+
+
 def local_to_image(center, forward, right, marker_side, local_points):
     """Convert marker-relative (forward, right) coordinates to image pixels."""
     points = []
@@ -202,8 +207,9 @@ def target_route(robot, gem):
     return distance, angle, path_cost
 
 
-def choose_nearest_target(markers, gems, robot_id=0):
-    """Pick the gem with the lowest distance-plus-turn path cost.
+def choose_nearest_target(markers, gems, robot_id=0,
+                          colour_order=AUTO_COLOUR_ORDER):
+    """Pick the nearest gem from the first available colour in the sequence.
 
     No target is returned if the requested marker is missing or ambiguous.
     This function only chooses a visual target; it never sends motor commands.
@@ -212,7 +218,14 @@ def choose_nearest_target(markers, gems, robot_id=0):
     if len(robots) != 1 or not gems:
         return None
     robot = robots[0]
-    gem = min(gems, key=lambda item: (
+    priorities = {colour: index for index, colour in enumerate(colour_order)}
+    first_priority = min(priorities.get(item['colour'], len(priorities))
+                         for item in gems)
+    current_colour_gems = [
+        item for item in gems
+        if priorities.get(item['colour'], len(priorities)) == first_priority
+    ]
+    gem = min(current_colour_gems, key=lambda item: (
         target_route(robot, item)[2],
         target_route(robot, item)[0],
         item['colour'], item['x'], item['y']))

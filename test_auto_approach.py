@@ -2,12 +2,38 @@ import unittest
 import time
 
 from auto_approach import (
-    ApproachRunner, DirectionController, gem_in_gripper, gripper_gem, match_target,
-    plan_delivery_step, plan_step,
+    FEEDBACK_DELAY_SECONDS, ApproachRunner, DirectionController, gem_in_gripper,
+    gripper_gem, match_target, plan_delivery_step, plan_step,
 )
 
 
 class AutoApproachTests(unittest.TestCase):
+    def test_drive_pulse_returns_immediately_with_1_5_second_feedback_deadline(self):
+        packets = []
+        runner = ApproachRunner(
+            lambda: None, packets.append, lambda: None, lambda: True)
+
+        started = time.monotonic()
+        move_after = runner._drive_pulse('F', .02)
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(FEEDBACK_DELAY_SECONDS, 1.5)
+        self.assertEqual(packets, ['PF,20\n'])
+        self.assertLess(elapsed, .5)
+        self.assertAlmostEqual(
+            move_after - time.monotonic(), FEEDBACK_DELAY_SECONDS, delta=.1)
+
+    def test_feedback_delay_displays_fresh_distance_and_angle(self):
+        runner = ApproachRunner(
+            lambda: None, lambda packet: None, lambda: None, lambda: True)
+
+        waiting = runner._show_feedback_delay(
+            time.monotonic() + 1.5, 'R', 123.4, -17.6)
+
+        self.assertTrue(waiting)
+        self.assertIn('ห่าง 123 px', runner.state()['message'])
+        self.assertIn('มุม -18°', runner.state()['message'])
+
     def test_locked_target_remains_usable_when_detection_is_missing(self):
         locked = {'colour': 'RED', 'x': 100, 'y': 50}
         self.assertIsNone(match_target([], locked))
@@ -60,6 +86,30 @@ class AutoApproachTests(unittest.TestCase):
             robot, {'x': 87, 'y': 50, 'radius': 20})[0], 'DROP')
         self.assertEqual(plan_delivery_step(
             robot, {'x': 150, 'y': 50, 'radius': 20})[0], 'F')
+
+    def test_delivery_prioritizes_distance_for_far_angled_hole(self):
+        robot = {
+            'x': 0, 'y': 0,
+            'gripper_tip_x': 20, 'gripper_tip_y': 0,
+            'marker_side_px': 20,
+        }
+        command, _, distance, angle = plan_delivery_step(
+            robot, {'x': 120, 'y': 57.74, 'radius': 10})
+        self.assertGreater(distance/robot['marker_side_px'], 3)
+        self.assertAlmostEqual(angle, 30, places=1)
+        self.assertEqual(command, 'F')
+
+    def test_delivery_aligns_only_when_close_to_hole(self):
+        robot = {
+            'x': 0, 'y': 0,
+            'gripper_tip_x': 20, 'gripper_tip_y': 0,
+            'marker_side_px': 20,
+        }
+        command, _, distance, angle = plan_delivery_step(
+            robot, {'x': 40, 'y': 11.55, 'radius': 5})
+        self.assertLess(distance/robot['marker_side_px'], 1.5)
+        self.assertAlmostEqual(angle, 30, places=1)
+        self.assertIn(command, ('L', 'R'))
 
     def test_forward_pulse_gets_shorter_near_target(self):
         robot = {
@@ -259,6 +309,46 @@ class AutoApproachTests(unittest.TestCase):
         self.assertIn('BLUE', guides)
         self.assertEqual(guides[-1], None)
         self.assertIn('วงสี BLUE', runner.state()['message'])
+
+    def test_auto_keeps_gripper_closed_when_carried_gem_is_occluded(self):
+        robot = {
+            'x': 20, 'y': 50, 'heading_deg': 0,
+            'gripper_tip_x': 80, 'gripper_tip_y': 50,
+            'marker_side_px': 20,
+        }
+        gem = {'colour': 'RED', 'x': 82, 'y': 51}
+        frame_index = 0
+        packets = []
+        guides = []
+        runner = None
+
+        def snapshot():
+            nonlocal frame_index
+            frame_index += 1
+            carrying = frame_index <= 4
+            return {
+                'time': time.monotonic(), 'frame_index': frame_index,
+                'robot': robot, 'gems': [gem] if carrying else [],
+                'gripper_gems': [gem] if carrying else [],
+                'holes': {'RED': {'x': 82, 'y': 51, 'radius': 20}},
+                'target': gem if carrying else None,
+            }
+
+        def send(packet):
+            packets.append(packet)
+            if packets == ['O', 'C', 'O', 'PB,60\n']:
+                runner.cancel.set()
+
+        runner = ApproachRunner(snapshot, send, lambda: None, lambda: True,
+                                guides.append)
+        runner.target = dict(gem)
+        runner.running = True
+        runner._run()
+
+        self.assertEqual(packets, ['O', 'C', 'O', 'PB,60\n'])
+        self.assertEqual(packets.count('O'), 2)
+        self.assertIn('RED', guides)
+        self.assertEqual(guides[-1], None)
 
 
 if __name__ == '__main__':

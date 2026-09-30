@@ -5,8 +5,8 @@ import threading
 import time
 
 
-# Leave the robot fully stopped before accepting a frame for the next command.
-SETTLE_SECONDS = 2.0
+# Recalculate from live camera frames for this long before the next small move.
+FEEDBACK_DELAY_SECONDS = 1.5
 TURN_ENTER_DEGREES = 12
 TURN_EXIT_DEGREES = 8
 TURN_MIN_PULSE_SECONDS = .025
@@ -144,11 +144,10 @@ class DirectionController:
 
 
 def plan_delivery_step(robot, hole, direction=None):
-    """Drive the gripper tip into a colour hole, then request a drop."""
+    """Approach a colour hole distance-first, then request a drop."""
     destination = {'x': hole['x'], 'y': hole['y']}
-    command, duration, distance, angle = (
-        direction.plan(robot, destination) if direction is not None
-        else plan_step(robot, destination))
+    direction = direction or DirectionController()
+    command, duration, distance, angle = direction.plan(robot, destination)
     drop_distance = max(12.0, .55 * float(hole['radius']))
     if distance <= drop_distance:
         return 'DROP', 0, distance, angle
@@ -219,7 +218,7 @@ class ApproachRunner:
         return False
 
     def _drive_pulse(self, command, duration):
-        """Request a firmware-timed pulse, then enforce a quiet camera period."""
+        """Request one small firmware-timed pulse and return the next-move time."""
         milliseconds = max(20, min(500, round(duration*1000)))
         if not self._send_continuous(f'P{command},{milliseconds}\n'):
             return None
@@ -229,10 +228,19 @@ class ApproachRunner:
             return None
         # This redundant stop is fail-safe; normal pulse timing is local to ESP32.
         self.stop_motors()
-        settled_at = time.monotonic() + SETTLE_SECONDS
-        if self.cancel.wait(SETTLE_SECONDS):
-            return None
-        return settled_at
+        return time.monotonic() + FEEDBACK_DELAY_SECONDS
+
+    def _show_feedback_delay(self, move_after, command, distance, angle,
+                             prefix=''):
+        """Keep reporting fresh geometry while waiting to make the next move."""
+        remaining = move_after - time.monotonic()
+        if remaining <= 0:
+            return False
+        lead = f'{prefix}: ' if prefix else ''
+        self._message(
+            f'{lead}คำนวณก่อนขยับ {command} | ห่าง {distance:.0f} px | '
+            f'มุม {angle:.0f}° | เหลือ {remaining:.1f} วิ')
+        return True
 
     def _run(self):
         last_frame = -1
@@ -243,7 +251,7 @@ class ApproachRunner:
         wrong_turns = 0
         capture_frames = 0
         phase = 'pickup'
-        minimum_capture_time = 0.0
+        next_move_at = 0.0
         direction = DirectionController()
         try:
             self._message('เปิดกริปเปอร์เพื่อเตรียมรับหิน')
@@ -262,9 +270,6 @@ class ApproachRunner:
                     self.stop_motors()
                     self._message('รอภาพกล้องอัปเดต')
                     self.cancel.wait(.10)
-                    continue
-                if observation.get('captured_at', observation['time']) < minimum_capture_time:
-                    self.cancel.wait(.01)
                     continue
                 if observation['frame_index'] == last_frame:
                     self.cancel.wait(.025)
@@ -299,11 +304,28 @@ class ApproachRunner:
                     direction.reset()
                     self._message(f'เลือกหินก้อนใหม่สี {self.target["colour"]}')
                 if phase == 'deliver':
+                    # Once closing was triggered by consecutive live detections,
+                    # keep that capture latched until the planned drop.  A held
+                    # gem is commonly hidden by the closed jaws, so missing HSV
+                    # detections are not evidence that it was dropped.
+                    carried = gripper_gem(
+                        robot, observation.get('gripper_gems', []))
+                    if (carried is not None
+                            and carried['colour'] != self.target['colour']):
+                        self.target = {key: carried[key]
+                                       for key in ('colour', 'x', 'y')}
+                        self.guide(self.target['colour'])
                     hole = observation.get('holes', {}).get(self.target['colour'])
                     if hole is None:
                         self.stop_motors()
                         self._message(f'รอวงรับหินสี {self.target["colour"]}')
                         self.cancel.wait(.25)
+                        continue
+                    command, duration, distance, angle = plan_delivery_step(
+                        robot, hole, direction)
+                    if self._show_feedback_delay(
+                            next_move_at, command, distance, angle,
+                            f'พาหินไปวง {self.target["colour"]}'):
                         continue
                     current_pose = (robot['x'], robot['y'], robot['heading_deg'])
                     if previous_pose is not None:
@@ -319,8 +341,6 @@ class ApproachRunner:
                             no_progress = 0
                             self.cancel.wait(.5)
                             continue
-                    command, duration, distance, angle = plan_delivery_step(
-                        robot, hole, direction)
                     if previous_turn_error is not None:
                         wrong_turns = (wrong_turns+1
                                        if abs(angle) > previous_turn_error+5 else 0)
@@ -340,11 +360,10 @@ class ApproachRunner:
                         completed_colour = self.target['colour']
                         self._message(
                             f'วางหินสี {completed_colour} แล้ว; กำลังถอยออกจากวง')
-                        settled_at = self._drive_pulse(
+                        next_move_at = self._drive_pulse(
                             'B', BACK_AWAY_PULSE_SECONDS)
-                        if settled_at is None:
+                        if next_move_at is None:
                             return
-                        minimum_capture_time = settled_at
                         self.target = None
                         self.guide(None)
                         phase = 'pickup'
@@ -364,10 +383,9 @@ class ApproachRunner:
                         f'pulse {duration*1000:.0f} ms')
                     previous_pose = current_pose
                     previous_turn_error = abs(angle) if command in ('L', 'R') else None
-                    settled_at = self._drive_pulse(command, duration)
-                    if settled_at is None:
+                    next_move_at = self._drive_pulse(command, duration)
+                    if next_move_at is None:
                         return
-                    minimum_capture_time = settled_at
                     continue
                 gem = match_target(observation['gems'], self.target)
                 if gem is None:
@@ -386,6 +404,13 @@ class ApproachRunner:
                     stable += 1
                     self._message(f'ยืนยันเป้าหมาย {stable}/3 เฟรม')
                     continue
+                # Require two consecutive camera frames with the target centre
+                # inside the jaw ROI before closing the gripper.
+                command, duration, distance, angle = direction.plan(
+                    robot, captured_gem or gem, captured=capture_frames >= 2)
+                if self._show_feedback_delay(
+                        next_move_at, command, distance, angle):
+                    continue
                 current_pose = (robot['x'], robot['y'], robot['heading_deg'])
                 if previous_pose is not None:
                     dx = current_pose[0]-previous_pose[0]
@@ -399,10 +424,6 @@ class ApproachRunner:
                         no_progress = 0
                         self.cancel.wait(.5)
                         continue
-                # Require two consecutive camera frames with the target centre
-                # inside the jaw ROI before closing the gripper.
-                command, duration, distance, angle = direction.plan(
-                    robot, captured_gem or gem, captured=capture_frames >= 2)
                 if previous_turn_error is not None:
                     wrong_turns = (wrong_turns+1 if abs(angle) > previous_turn_error+5
                                    else 0)
@@ -437,10 +458,9 @@ class ApproachRunner:
                     f'มุม {angle:.0f}° | pulse {duration*1000:.0f} ms')
                 previous_pose = current_pose
                 previous_turn_error = abs(angle) if command in ('L', 'R') else None
-                settled_at = self._drive_pulse(command, duration)
-                if settled_at is None:
+                next_move_at = self._drive_pulse(command, duration)
+                if next_move_at is None:
                     return
-                minimum_capture_time = settled_at
         except (ValueError, ConnectionError) as exc:
             # Unexpected command/geometry errors still leave the motors safe.
             # The outer controller can be started again after the cause is fixed.
