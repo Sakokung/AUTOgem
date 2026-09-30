@@ -183,8 +183,27 @@ def open_camera(index, backend, width, height):
     return None
 
 
+def target_route(robot, gem):
+    """Return distance, shortest signed turn, and path cost to one gem."""
+    x, y = robot['x'], robot['y']
+    tip_x, tip_y = robot['gripper_tip_x'], robot['gripper_tip_y']
+    fx, fy = tip_x-x, tip_y-y
+    dx, dy = gem['x']-tip_x, gem['y']-tip_y
+    forward = float(np.hypot(fx, fy))
+    distance = float(np.hypot(dx, dy))
+    marker_side = max(1.0, float(robot.get('marker_side_px', 1.0)))
+    if forward < 1e-6:
+        return distance, 0.0, float('inf')
+    angle = float(np.degrees(np.arctan2(fx*dy-fy*dx, fx*dx+fy*dy)))
+    # Approximate the time cost of turning: every 45 degrees counts as one
+    # marker width of forward travel. This avoids a close target behind the
+    # robot winning over a slightly farther target already in front of it.
+    path_cost = distance + marker_side*abs(angle)/45.0
+    return distance, angle, path_cost
+
+
 def choose_nearest_target(markers, gems, robot_id=0):
-    """Pick a confirmed active gem by distance from one robot's gripper tip.
+    """Pick the gem with the lowest distance-plus-turn path cost.
 
     No target is returned if the requested marker is missing or ambiguous.
     This function only chooses a visual target; it never sends motor commands.
@@ -193,11 +212,11 @@ def choose_nearest_target(markers, gems, robot_id=0):
     if len(robots) != 1 or not gems:
         return None
     robot = robots[0]
-    tip_x, tip_y = robot['gripper_tip_x'], robot['gripper_tip_y']
     gem = min(gems, key=lambda item: (
-        (item['x'] - tip_x)**2 + (item['y'] - tip_y)**2,
+        target_route(robot, item)[2],
+        target_route(robot, item)[0],
         item['colour'], item['x'], item['y']))
-    distance_px = ((gem['x']-tip_x)**2 + (gem['y']-tip_y)**2)**.5
+    distance_px, _, _ = target_route(robot, gem)
     return robot, gem, distance_px
 
 

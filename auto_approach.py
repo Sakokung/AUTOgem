@@ -1,7 +1,36 @@
 """Continuous camera-feedback pickup and colour-sorting controller."""
 import math
+import statistics
 import threading
 import time
+
+
+# Leave the robot fully stopped before accepting a frame for the next command.
+SETTLE_SECONDS = 2.0
+TURN_ENTER_DEGREES = 12
+TURN_EXIT_DEGREES = 8
+TURN_MIN_PULSE_SECONDS = .025
+TURN_MAX_PULSE_SECONDS = .055
+FORWARD_MIN_PULSE_SECONDS = .03
+FORWARD_MAX_PULSE_SECONDS = .10
+BACK_AWAY_PULSE_SECONDS = .06
+
+
+def _scaled_pulse(error, near, far, minimum, maximum):
+    """Scale a pulse continuously and keep it inside usable motor limits."""
+    if far <= near:
+        return minimum
+    ratio = max(0.0, min(1.0, (error-near)/(far-near)))
+    return minimum + ratio*(maximum-minimum)
+
+
+def alignment_limits(distance_scale):
+    """Allow rough approach while far away, then align near the gripper."""
+    if distance_scale > 3.0:
+        return 40.0, 28.0
+    if distance_scale > 1.5:
+        return 25.0, 16.0
+    return float(TURN_ENTER_DEGREES), float(TURN_EXIT_DEGREES)
 
 
 def match_target(gems, locked, max_shift=30):
@@ -10,6 +39,15 @@ def match_target(gems, locked, max_shift=30):
                <= max_shift**2]
     return min(matches, key=lambda gem:
                (gem['x']-locked['x'])**2 + (gem['y']-locked['y'])**2) if matches else None
+
+
+def gripper_gem(robot, gems):
+    """Return the detected gem nearest the gripper tip, regardless of old lock."""
+    if not gems:
+        return None
+    tip_x, tip_y = robot['gripper_tip_x'], robot['gripper_tip_y']
+    return min(gems, key=lambda gem:
+               (gem['x']-tip_x)**2 + (gem['y']-tip_y)**2)
 
 
 def gem_in_gripper(robot, gem, max_tip_distance_scale=.72,
@@ -36,7 +74,8 @@ def gem_in_gripper(robot, gem, max_tip_distance_scale=.72,
             and lateral <= max_lateral_scale*marker_side)
 
 
-def plan_step(robot, gem, captured=False):
+def plan_step(robot, gem, captured=False, angle_override=None,
+              turn_threshold=TURN_ENTER_DEGREES):
     """Return (command, pulse seconds, distance px, signed angle degrees)."""
     x, y = robot['x'], robot['y']
     tip_x, tip_y = robot['gripper_tip_x'], robot['gripper_tip_y']
@@ -46,33 +85,83 @@ def plan_step(robot, gem, captured=False):
     distance = math.hypot(dx, dy)
     if forward < 8 or not math.isfinite(distance):
         raise ValueError('พิกัดปลาย Gripper ไม่ชัด')
-    angle = math.degrees(math.atan2(fx*dy-fy*dx, fx*dx+fy*dy))
-    stop_distance = max(28.0, .72*robot['marker_side_px'])
+    measured_angle = math.degrees(math.atan2(fx*dy-fy*dx, fx*dx+fy*dy))
+    angle = measured_angle if angle_override is None else float(angle_override)
+    marker_side = float(robot['marker_side_px'])
+    if marker_side <= 0:
+        raise ValueError('Invalid ArUco marker size')
     if captured:
         return 'GRIP', 0, distance, angle
-    if abs(angle) > 12:
-        return ('R' if angle > 0 else 'L'), .12, distance, angle
-    return 'F', (.12 if distance < 2*stop_distance else .18), distance, angle
+    if abs(angle) > turn_threshold:
+        duration = _scaled_pulse(
+            abs(angle), turn_threshold, 90,
+            TURN_MIN_PULSE_SECONDS, TURN_MAX_PULSE_SECONDS)
+        return ('R' if angle > 0 else 'L'), duration, distance, angle
+    duration = _scaled_pulse(
+        distance/marker_side, .7, 5.0,
+        FORWARD_MIN_PULSE_SECONDS, FORWARD_MAX_PULSE_SECONDS)
+    return 'F', duration, distance, angle
 
 
-def plan_delivery_step(robot, hole):
+class DirectionController:
+    """Smooth visual headings and avoid rapid left/right reversals."""
+    def __init__(self):
+        self.samples = []
+        self.aligning = False
+        self.last_turn_angle = None
+
+    def reset(self):
+        self.samples.clear()
+        self.aligning = False
+        self.last_turn_angle = None
+
+    def plan(self, robot, destination, captured=False):
+        raw = plan_step(robot, destination, captured=captured)
+        if captured:
+            return raw
+        self.samples.append(raw[3])
+        del self.samples[:-3]
+        angle = statistics.median(self.samples)
+        marker_side = max(1.0, float(robot['marker_side_px']))
+        enter_angle, exit_angle = alignment_limits(raw[2]/marker_side)
+
+        crossed_centre = (self.last_turn_angle is not None
+                           and angle*self.last_turn_angle < 0
+                           and abs(angle) <= enter_angle)
+        if crossed_centre or abs(angle) <= exit_angle:
+            self.aligning = False
+        elif abs(angle) > enter_angle:
+            self.aligning = True
+
+        threshold = exit_angle if self.aligning else enter_angle
+        result = plan_step(robot, destination, angle_override=angle,
+                           turn_threshold=threshold)
+        if result[0] in ('L', 'R'):
+            self.last_turn_angle = angle
+        else:
+            self.last_turn_angle = None
+        return result
+
+
+def plan_delivery_step(robot, hole, direction=None):
     """Drive the gripper tip into a colour hole, then request a drop."""
     destination = {'x': hole['x'], 'y': hole['y']}
-    _, duration, distance, angle = plan_step(robot, destination)
+    command, duration, distance, angle = (
+        direction.plan(robot, destination) if direction is not None
+        else plan_step(robot, destination))
     drop_distance = max(12.0, .55 * float(hole['radius']))
     if distance <= drop_distance:
         return 'DROP', 0, distance, angle
-    if abs(angle) > 12:
-        return ('R' if angle > 0 else 'L'), .12, distance, angle
-    return 'F', (.10 if distance < 2.2*drop_distance else .18), distance, angle
+    return command, duration, distance, angle
 
 
 class ApproachRunner:
-    def __init__(self, snapshot, send, stop, ready):
+    def __init__(self, snapshot, send, stop, ready, guide=None):
         self.snapshot = snapshot
         self.send = send
         self.stop_motors = stop
         self.ready = ready
+        self.guide = guide or (lambda colour: None)
         self.lock = threading.RLock()
         self.cancel = threading.Event()
         self.running = False
@@ -114,6 +203,7 @@ class ApproachRunner:
     def abort(self):
         self.cancel.set()
         self.stop_motors()
+        self.guide(None)
         self._message('หยุดตามคำสั่ง')
 
     def _send_continuous(self, packet):
@@ -128,6 +218,22 @@ class ApproachRunner:
                 self.cancel.wait(.5)
         return False
 
+    def _drive_pulse(self, command, duration):
+        """Request a firmware-timed pulse, then enforce a quiet camera period."""
+        milliseconds = max(20, min(500, round(duration*1000)))
+        if not self._send_continuous(f'P{command},{milliseconds}\n'):
+            return None
+        self.pulses += 1
+        if self.cancel.wait(duration):
+            self.stop_motors()
+            return None
+        # This redundant stop is fail-safe; normal pulse timing is local to ESP32.
+        self.stop_motors()
+        settled_at = time.monotonic() + SETTLE_SECONDS
+        if self.cancel.wait(SETTLE_SECONDS):
+            return None
+        return settled_at
+
     def _run(self):
         last_frame = -1
         stable = 0
@@ -137,6 +243,8 @@ class ApproachRunner:
         wrong_turns = 0
         capture_frames = 0
         phase = 'pickup'
+        minimum_capture_time = 0.0
+        direction = DirectionController()
         try:
             self._message('เปิดกริปเปอร์เพื่อเตรียมรับหิน')
             if not self._send_continuous('O'):
@@ -154,6 +262,9 @@ class ApproachRunner:
                     self.stop_motors()
                     self._message('รอภาพกล้องอัปเดต')
                     self.cancel.wait(.10)
+                    continue
+                if observation.get('captured_at', observation['time']) < minimum_capture_time:
+                    self.cancel.wait(.01)
                     continue
                 if observation['frame_index'] == last_frame:
                     self.cancel.wait(.025)
@@ -185,6 +296,7 @@ class ApproachRunner:
                     previous_turn_error = None
                     wrong_turns = 0
                     no_progress = 0
+                    direction.reset()
                     self._message(f'เลือกหินก้อนใหม่สี {self.target["colour"]}')
                 if phase == 'deliver':
                     hole = observation.get('holes', {}).get(self.target['colour'])
@@ -207,7 +319,8 @@ class ApproachRunner:
                             no_progress = 0
                             self.cancel.wait(.5)
                             continue
-                    command, duration, distance, angle = plan_delivery_step(robot, hole)
+                    command, duration, distance, angle = plan_delivery_step(
+                        robot, hole, direction)
                     if previous_turn_error is not None:
                         wrong_turns = (wrong_turns+1
                                        if abs(angle) > previous_turn_error+5 else 0)
@@ -225,7 +338,15 @@ class ApproachRunner:
                             return
                         self.cancel.wait(.7)
                         completed_colour = self.target['colour']
+                        self._message(
+                            f'วางหินสี {completed_colour} แล้ว; กำลังถอยออกจากวง')
+                        settled_at = self._drive_pulse(
+                            'B', BACK_AWAY_PULSE_SECONDS)
+                        if settled_at is None:
+                            return
+                        minimum_capture_time = settled_at
                         self.target = None
+                        self.guide(None)
                         phase = 'pickup'
                         stable = 0
                         capture_frames = 0
@@ -233,19 +354,20 @@ class ApproachRunner:
                         previous_turn_error = None
                         wrong_turns = 0
                         no_progress = 0
+                        direction.reset()
                         self._message(
                             f'วางหินในวงสี {completed_colour} แล้ว; รอหินก้อนถัดไป')
                         continue
                     self._message(
                         f'พาหินไปวง {self.target["colour"]}: {command} | '
-                        f'ห่าง {distance:.0f} px | มุม {angle:.0f}°')
+                        f'ห่าง {distance:.0f} px | มุม {angle:.0f}° | '
+                        f'pulse {duration*1000:.0f} ms')
                     previous_pose = current_pose
                     previous_turn_error = abs(angle) if command in ('L', 'R') else None
-                    if not self._send_continuous(command):
+                    settled_at = self._drive_pulse(command, duration)
+                    if settled_at is None:
                         return
-                    self.pulses += 1
-                    self.cancel.wait(duration)
-                    self.stop_motors()
+                    minimum_capture_time = settled_at
                     continue
                 gem = match_target(observation['gems'], self.target)
                 if gem is None:
@@ -255,8 +377,10 @@ class ApproachRunner:
                     self._message('มองไม่เห็นเป้าหมาย; ไปยังพิกัดล่าสุดต่อ')
                 else:
                     self.target = {key: gem[key] for key in ('colour', 'x', 'y')}
-                captured_gem = match_target(
-                    observation.get('gripper_gems', []), self.target)
+                # The jaw ROI is stronger evidence than the old target lock:
+                # close for any stone actually seen between the gripper arms.
+                captured_gem = gripper_gem(
+                    robot, observation.get('gripper_gems', []))
                 capture_frames = capture_frames + 1 if captured_gem is not None else 0
                 if stable < 3:
                     stable += 1
@@ -277,7 +401,7 @@ class ApproachRunner:
                         continue
                 # Require two consecutive camera frames with the target centre
                 # inside the jaw ROI before closing the gripper.
-                command, duration, distance, angle = plan_step(
+                command, duration, distance, angle = direction.plan(
                     robot, captured_gem or gem, captured=capture_frames >= 2)
                 if previous_turn_error is not None:
                     wrong_turns = (wrong_turns+1 if abs(angle) > previous_turn_error+5
@@ -290,6 +414,11 @@ class ApproachRunner:
                         self.cancel.wait(.35)
                         continue
                 if command == 'GRIP':
+                    # Deliver according to the stone that is physically in the
+                    # gripper, even if it differs from the earlier visual lock.
+                    self.target = {key: captured_gem[key]
+                                   for key in ('colour', 'x', 'y')}
+                    self.guide(self.target['colour'])
                     self.stop_motors()
                     self._message(f'พบหินในกริปเปอร์ {distance:.0f} px; กำลังคีบ')
                     if not self._send_continuous('C'):
@@ -297,24 +426,27 @@ class ApproachRunner:
                     self.cancel.wait(.7)
                     self._message(f'คีบหินแล้ว; กำลังไปวงสี {self.target["colour"]}')
                     phase = 'deliver'
+                    direction.reset()
                     previous_pose = None
                     previous_turn_error = None
                     wrong_turns = 0
                     no_progress = 0
                     continue
-                self._message(f'{command} สั้น ๆ | ห่าง {distance:.0f} px | มุม {angle:.0f}°')
+                self._message(
+                    f'{command} สั้น ๆ | ห่าง {distance:.0f} px | '
+                    f'มุม {angle:.0f}° | pulse {duration*1000:.0f} ms')
                 previous_pose = current_pose
                 previous_turn_error = abs(angle) if command in ('L', 'R') else None
-                if not self._send_continuous(command):
+                settled_at = self._drive_pulse(command, duration)
+                if settled_at is None:
                     return
-                self.pulses += 1
-                self.cancel.wait(duration)
-                self.stop_motors()
+                minimum_capture_time = settled_at
         except (ValueError, ConnectionError) as exc:
             # Unexpected command/geometry errors still leave the motors safe.
             # The outer controller can be started again after the cause is fixed.
             self._message(str(exc))
         finally:
             self.stop_motors()
+            self.guide(None)
             with self.lock:
                 self.running = False

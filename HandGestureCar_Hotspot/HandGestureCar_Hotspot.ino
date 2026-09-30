@@ -76,10 +76,20 @@ int leftInnerSpeed = 210;
 int rightInnerSpeed = 210;
 char motion = 'S';
 unsigned long lastMotionCommand = 0;
+unsigned long pulseStopAt = 0;
+bool pulseActive = false;
 
 void stopCar() {
   ledcWrite(M1_IN1, 0); ledcWrite(M1_IN2, 0);
   ledcWrite(M2_IN1, 0); ledcWrite(M2_IN2, 0);
+}
+
+void serviceTimedPulse() {
+  if (pulseActive && (long)(millis() - pulseStopAt) >= 0) {
+    pulseActive = false;
+    motion = 'S';
+    stopCar();
+  }
 }
 
 void applyMotion() {
@@ -137,8 +147,10 @@ void setup() {
 
 void loop() {
   serviceWiFi();
+  serviceTimedPulse();
   if (motion != 'S' && millis() - lastMotionCommand > 700) {
     motion = 'S';
+    pulseActive = false;
     stopCar();
   }
   WiFiClient client = server.available();
@@ -148,19 +160,42 @@ void loop() {
   char settingsType = 'T';
   while (client.connected()) {
     serviceWiFi();
+    serviceTimedPulse();
     if (motion != 'S' && millis() - lastMotionCommand > 700) {
       motion = 'S';
+      pulseActive = false;
       stopCar();
     }
     if (!client.available()) { delay(2); continue; }
     char c = client.read();
     if (readingSettings) {
       if (c == '\n') {
+        if (settingsType == 'P') {
+          char direction, extra;
+          unsigned long durationMs;
+          if (sscanf(settingLine.c_str(), "%c,%lu%c", &direction, &durationMs, &extra) == 2 &&
+              (direction == 'F' || direction == 'B' || direction == 'L' || direction == 'R') &&
+              durationMs >= 20 && durationMs <= 500) {
+            motion = direction;
+            lastMotionCommand = millis();
+            pulseStopAt = lastMotionCommand + durationMs;
+            pulseActive = true;
+            applyMotion();
+          } else {
+            motion = 'S';
+            pulseActive = false;
+            stopCar();
+          }
+          settingLine = "";
+          readingSettings = false;
+          continue;
+        }
         int a, b, left, right;
         char extra;
         // A: left open, left close, right open, right close.
         if (settingsType == 'A') {
           motion = 'S';
+          pulseActive = false;
           stopCar();
           if (sscanf(settingLine.c_str(), "%d,%d,%d,%d%c", &a, &b, &left, &right, &extra) == 4 &&
               a >= 0 && a <= 180 && b >= 0 && b <= 180 &&
@@ -182,6 +217,7 @@ void loop() {
             left >= 0 && left <= 255 && right >= 0 && right <= 255) {
           m1Speed = a; m2Speed = b;
           leftInnerSpeed = left; rightInnerSpeed = right;
+          pulseActive = false;
           applyMotion();
           client.print("OK\n");
         } else {
@@ -199,21 +235,24 @@ void loop() {
     } else if (c == 'Q') {
       client.printf("ANGLES,%d,%d,%d,%d\n", GRIP_LEFT_OPEN_ANGLE,
                     GRIP_LEFT_CLOSE_ANGLE, GRIP_RIGHT_OPEN_ANGLE, GRIP_RIGHT_CLOSE_ANGLE);
-    } else if (c == 'T' || c == 'A') {
+    } else if (c == 'T' || c == 'A' || c == 'P') {
       settingsType = c;
       readingSettings = true;
       settingLine = "";
     } else if (c == 'O' || c == 'C') {
       motion = 'S';
+      pulseActive = false;
       stopCar();
       setGripper(c == 'O');
     } else if (c == 'F' || c == 'B' || c == 'L' || c == 'R' || c == 'S') {
       motion = c;
+      pulseActive = false;
       lastMotionCommand = millis();
       applyMotion();
     }
   }
   motion = 'S';
+  pulseActive = false;
   stopCar();
   client.stop();
 }

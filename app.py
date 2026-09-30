@@ -149,7 +149,7 @@ def auto_stop_motors():
 
 
 auto = ApproachRunner(vision.auto_snapshot, auto_send, auto_stop_motors,
-                      auto_ready)
+                      auto_ready, vision.set_delivery_guide)
 
 
 class StillImageCamera:
@@ -179,6 +179,7 @@ def field_worker():
                 if field_cap is None:
                     break
                 ok, frame = field_cap.read()
+                captured_at = time.monotonic()
             if not ok:
                 time.sleep(.05)
                 continue
@@ -186,7 +187,7 @@ def field_worker():
                 ratio = 1200 / frame.shape[1]
                 frame = cv2.resize(frame, None, fx=ratio, fy=ratio,
                                    interpolation=cv2.INTER_AREA)
-            vision.set_frame(frame)
+            vision.set_frame(frame, captured_at)
             shown = vision.render()
             mask = vision.colour_mask()
             encoded_ok, jpg = cv2.imencode('.jpg', shown,

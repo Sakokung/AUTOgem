@@ -84,10 +84,12 @@ class VisionPanel:
         self.hole_pending = None
         self.samples = {colour: [] for colour in COLOURS}
         self.frame = None
+        self.frame_captured_at = 0.0
         self.dirty = False
         self.frame_index = 0
         self.last_preview = None
         self.observation = None
+        self.delivery_colour = None
         if self.config_path.exists():
             self.config = valid_config(json.loads(self.config_path.read_text(encoding='utf-8-sig')))
             self.saved_config = copy.deepcopy(self.config)
@@ -127,6 +129,12 @@ class VisionPanel:
     def auto_snapshot(self):
         with self.lock:
             return copy.deepcopy(self.observation)
+
+    def set_delivery_guide(self, colour):
+        if colour is not None and colour not in COLOURS:
+            raise ValueError('Invalid delivery guide colour')
+        with self.lock:
+            self.delivery_colour = colour
 
     def select(self, colour, hole=False):
         if colour not in COLOURS:
@@ -202,9 +210,11 @@ class VisionPanel:
             self.field['holes'].pop(self.hole_colour, None)
             self.hole_pending = None
 
-    def set_frame(self, frame):
+    def set_frame(self, frame, captured_at=None):
         with self.lock:
             self.frame = frame.copy()
+            self.frame_captured_at = (time.monotonic() if captured_at is None
+                                      else float(captured_at))
             self.frame_index += 1
 
     def click(self, point):
@@ -335,9 +345,25 @@ class VisionPanel:
                     cv2.putText(shown, f"ArUco {marker['aruco_id']}",
                                 (marker['x']+8, marker['y']-12),
                                 cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 255, 0), 2)
-                selected = choose_nearest_target(markers, available_gems, robot_id=0)
+                if (robot is not None and self.delivery_colour in holes):
+                    hole = holes[self.delivery_colour]
+                    start = (robot['gripper_tip_x'], robot['gripper_tip_y'])
+                    destination = (hole['x'], hole['y'])
+                    colour = DISPLAY_COLOURS[self.delivery_colour]
+                    cv2.arrowedLine(shown, start, destination, colour, 5,
+                                    cv2.LINE_AA, tipLength=.08)
+                    label = f"DELIVER {self.delivery_colour}"
+                    cv2.putText(shown, label,
+                                (min(start[0], destination[0])+8,
+                                 max(24, min(start[1], destination[1])-10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, .65, colour, 2,
+                                cv2.LINE_AA)
+                selected = (None if self.delivery_colour is not None else
+                            choose_nearest_target(markers, available_gems,
+                                                  robot_id=0))
                 self.observation = {
                     'time': time.monotonic(), 'frame_index': self.frame_index,
+                    'captured_at': self.frame_captured_at,
                     # Keep the robot pose available even when no gem is visible.
                     # Auto mode can then continue toward its last locked target.
                     'robot': copy.deepcopy(robot),
