@@ -29,6 +29,15 @@ ESP32_PORT = int(os.environ.get('ESP32_PORT', '80'))
 ANGLE_KEYS = ('left_open', 'left_close', 'right_open', 'right_close')
 SPEED_KEYS = ('M1_SPEED', 'M2_SPEED', 'LEFT_INNER_SPEED', 'RIGHT_INNER_SPEED')
 speeds = dict(zip(SPEED_KEYS, (227, 245, 210, 210)))
+CAMERA_LABELS = {
+    'iriun': 'Iriun Camera',
+    'usb': 'กล้องสนาม USB',
+}
+CAMERA_DEFAULTS = {
+    'iriun': int(os.environ.get('IRIUN_CAMERA', '0')),
+    'usb': int(os.environ.get('FIELD_CAMERA', '1')),
+}
+VISION_MAX_WIDTH = max(320, int(os.environ.get('VISION_MAX_WIDTH', '640')))
 
 
 class CarLink:
@@ -126,9 +135,16 @@ field_frame_lock = threading.Lock()
 field_cap = None
 field_running = False
 field_thread = None
+field_capture_thread = None
 field_frame = None
 mask_frame = None
 field_error = None
+field_raw_condition = threading.Condition()
+field_raw_frame = None
+field_raw_captured_at = 0.0
+field_raw_index = 0
+field_camera_source = 'usb'
+field_camera_index = CAMERA_DEFAULTS[field_camera_source]
 
 
 def auto_ready():
@@ -149,7 +165,8 @@ def auto_stop_motors():
 
 
 auto = ApproachRunner(vision.auto_snapshot, auto_send, auto_stop_motors,
-                      auto_ready, vision.set_delivery_guide)
+                      auto_ready, guide=vision.set_delivery_guide,
+                      select_colour=vision.set_auto_colour)
 
 
 class StillImageCamera:
@@ -171,8 +188,10 @@ class StillImageCamera:
         pass
 
 
-def field_worker():
-    global field_frame, mask_frame, field_error, field_running, field_cap
+def field_capture_worker():
+    """Continuously drain the camera and retain only its newest frame."""
+    global field_error, field_running, field_cap
+    global field_raw_frame, field_raw_captured_at, field_raw_index
     try:
         while field_running:
             with field_lock:
@@ -183,8 +202,45 @@ def field_worker():
             if not ok:
                 time.sleep(.05)
                 continue
-            if frame.shape[1] > 1200:
-                ratio = 1200 / frame.shape[1]
+            with field_raw_condition:
+                field_raw_frame = frame
+                field_raw_captured_at = captured_at
+                field_raw_index += 1
+                field_raw_condition.notify()
+    except (cv2.error, ValueError) as exc:
+        field_error = str(exc)
+    finally:
+        with field_lock:
+            field_running = False
+            if field_cap is not None:
+                field_cap.release()
+                field_cap = None
+        with field_raw_condition:
+            field_raw_condition.notify_all()
+
+
+def field_worker():
+    global field_frame, mask_frame, field_error, field_running
+    last_raw_index = 0
+    try:
+        while True:
+            with field_raw_condition:
+                field_raw_condition.wait_for(
+                    lambda: field_raw_index != last_raw_index or not field_running,
+                    timeout=.5)
+                if field_raw_index == last_raw_index:
+                    if not field_running:
+                        break
+                    continue
+                if field_raw_frame is None:
+                    if not field_running:
+                        break
+                    continue
+                frame = field_raw_frame.copy()
+                captured_at = field_raw_captured_at
+                last_raw_index = field_raw_index
+            if frame.shape[1] > VISION_MAX_WIDTH:
+                ratio = VISION_MAX_WIDTH / frame.shape[1]
                 frame = cv2.resize(frame, None, fx=ratio, fy=ratio,
                                    interpolation=cv2.INTER_AREA)
             vision.set_frame(frame, captured_at)
@@ -200,44 +256,57 @@ def field_worker():
                     mask_frame = mask_jpg.tobytes() if mask_ok else None
     except (cv2.error, ValueError) as exc:
         field_error = str(exc)
+        field_running = False
+        with field_raw_condition:
+            field_raw_condition.notify_all()
     finally:
-        with field_lock:
-            field_running = False
-            if field_cap is not None:
-                field_cap.release()
-                field_cap = None
         with field_frame_lock:
             field_frame = None
             mask_frame = None
 
 
 def start_field_camera():
-    global field_cap, field_running, field_thread, field_error
+    global field_cap, field_running, field_thread, field_capture_thread, field_error
+    global field_raw_frame, field_raw_captured_at, field_raw_index
     with field_lock:
         if field_running:
             return True
         example = os.environ.get('FIELD_IMAGE')
         camera = (StillImageCamera(example) if example else
-                  cv2.VideoCapture(int(os.environ.get('FIELD_CAMERA', '1'))))
+                  cv2.VideoCapture(field_camera_index))
         if not camera.isOpened():
             camera.release()
-            field_error = 'เปิดกล้องสนามไม่ได้ ตรวจหมายเลขกล้องหรือไฟล์ภาพ'
+            label = CAMERA_LABELS[field_camera_source]
+            field_error = (f'เปิด {label} (Camera Index {field_camera_index}) ไม่ได้ '
+                           'ตรวจหมายเลขกล้องหรือปิดโปรแกรมอื่นที่กำลังใช้กล้อง')
             return False
         if not example:
+            # Ask Windows cameras for a compressed 30 FPS stream and prevent
+            # old frames accumulating while vision processing is busy.
+            camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
             camera.set(cv2.CAP_PROP_FRAME_WIDTH,
                        int(os.environ.get('FIELD_WIDTH', '1920')))
             camera.set(cv2.CAP_PROP_FRAME_HEIGHT,
                        int(os.environ.get('FIELD_HEIGHT', '1080')))
+            camera.set(cv2.CAP_PROP_FPS, 30)
+            camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         field_error = None
         field_cap = camera
         field_running = True
+        with field_raw_condition:
+            field_raw_frame = None
+            field_raw_captured_at = 0.0
+            field_raw_index = 0
+    field_capture_thread = threading.Thread(target=field_capture_worker, daemon=True)
     field_thread = threading.Thread(target=field_worker, daemon=True)
+    field_capture_thread.start()
     field_thread.start()
     return True
 
 
 def stop_field_camera():
-    global field_running, field_thread, field_frame, mask_frame, field_cap
+    global field_running, field_thread, field_capture_thread
+    global field_frame, mask_frame, field_cap, field_raw_frame
     if auto.state()['running']:
         auto.abort()
     with field_lock:
@@ -245,12 +314,19 @@ def stop_field_camera():
         if field_cap is not None:
             field_cap.release()
             field_cap = None
+    with field_raw_condition:
+        field_raw_frame = None
+        field_raw_condition.notify_all()
     with field_frame_lock:
         field_frame = None
         mask_frame = None
     if field_thread is not None and field_thread is not threading.current_thread():
         field_thread.join(timeout=3)
         field_thread = None
+    if (field_capture_thread is not None
+            and field_capture_thread is not threading.current_thread()):
+        field_capture_thread.join(timeout=3)
+        field_capture_thread = None
 
 
 def generate_field_frames(mask_only=False):
@@ -271,9 +347,35 @@ def index():
 
 @app.route('/field/start', methods=['POST'])
 def field_start():
+    global field_camera_source, field_camera_index
     touch_browser()
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify(ok=False, error='ข้อมูลกล้องไม่ถูกต้อง'), 400
+    source = data.get('source', field_camera_source)
+    index = data.get('index', CAMERA_DEFAULTS.get(source))
+    if source not in CAMERA_LABELS:
+        return jsonify(ok=False, error='กรุณาเลือก Iriun Camera หรือกล้องสนาม USB'), 400
+    if isinstance(index, bool):
+        return jsonify(ok=False, error='Camera Index ต้องเป็นเลข 0 ถึง 99'), 400
+    try:
+        index = int(index)
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error='Camera Index ต้องเป็นเลข 0 ถึง 99'), 400
+    if not 0 <= index <= 99:
+        return jsonify(ok=False, error='Camera Index ต้องเป็นเลข 0 ถึง 99'), 400
+
+    if field_running and (source != field_camera_source or index != field_camera_index):
+        stop_field_camera()
+    with field_lock:
+        field_camera_source = source
+        field_camera_index = index
     ok = start_field_camera()
     return jsonify(ok=ok, field='ON' if ok else 'OFF',
+                   camera_source=field_camera_source,
+                   camera_index=field_camera_index,
                    error=None if ok else field_error), 200 if ok else 503
 
 
@@ -539,6 +641,9 @@ def status():
     host, port = link.endpoint
     return jsonify(esp32=link.status, field='ON' if field_running else 'OFF',
                    field_error=field_error, manual=button_active, demo=DEMO_MODE,
+                   camera_source=field_camera_source,
+                   camera_index=field_camera_index,
+                   camera_defaults=CAMERA_DEFAULTS,
                    auto=auto.state(), esp32_ip=host, esp32_port=port)
 
 
@@ -588,5 +693,10 @@ atexit.register(cleanup)
 threading.Thread(target=watchdog, daemon=True).start()
 
 if __name__ == '__main__':
-    print('Open http://127.0.0.1:5000')
-    app.run(host='127.0.0.1', port=5000, debug=False, threaded=True)
+    # The default application is now a native local window. No web server is
+    # started by the normal command.
+    import sys
+    # Reuse this initialized backend instead of importing a second copy.
+    sys.modules['app'] = sys.modules[__name__]
+    from desktop_app import main
+    main()

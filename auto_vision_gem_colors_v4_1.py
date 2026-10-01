@@ -343,8 +343,12 @@ def configured_hsv_masks(frame, config):
     """Create exclusive HSV masks; overlaps go to the nearest HSV centre."""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
     h, s, v = cv2.split(hsv)
-    accepted, scores = [], []
-    for colour in COLOURS:
+    # Keep only the current winner instead of stacking six full-frame boolean
+    # and float arrays.  Besides using much less memory, this matters in the
+    # live view where this function runs for every camera frame.
+    best = np.full(h.shape, -1, np.int8)
+    best_score = np.full(h.shape, np.inf, np.float32)
+    for index, colour in enumerate(COLOURS):
         item = config['colours'][colour]
         dh = np.minimum(np.abs(h - item['h_center']),
                         180.0 - np.abs(h - item['h_center']))
@@ -353,14 +357,13 @@ def configured_hsv_masks(frame, config):
         ht = max(float(item['h_tolerance']), 1.0)
         st = max(float(item['s_tolerance']), 1.0)
         vt = max(float(item['v_tolerance']), 1.0)
-        accepted.append((dh <= ht) & (ds <= st) & (dv <= vt))
-        scores.append((dh / ht) ** 2 + (ds / st) ** 2 + (dv / vt) ** 2)
-    accepted = np.stack(accepted, axis=-1)
-    scores = np.stack(scores, axis=-1)
-    scores[~accepted] = np.inf
-    best = np.argmin(scores, axis=-1)
-    any_match = np.isfinite(scores).any(axis=-1)
-    return {colour: ((best == index) & any_match).astype(np.uint8) * 255
+        accepted = (dh <= ht) & (ds <= st) & (dv <= vt)
+        score = (dh / ht) ** 2 + (ds / st) ** 2 + (dv / vt) ** 2
+        # Strict comparison preserves np.argmin's first-colour tie breaking.
+        take = accepted & (score < best_score)
+        best[take] = index
+        best_score[take] = score[take]
+    return {colour: (best == index).astype(np.uint8) * 255
             for index, colour in enumerate(COLOURS)}
 
 
@@ -469,7 +472,8 @@ def blob_centers(component, min_distance, peak_relative, require_neck=False,
 
 
 def detect(frame, blue_sat=165, peak_relative=.55, min_distance=9,
-           colour_model=None, extra_excluded=None, hsv_config=None):
+           colour_model=None, extra_excluded=None, hsv_config=None,
+           active_colours=None):
     height, width = frame.shape[:2]
     scale = width / REFERENCE_WIDTH
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -479,6 +483,14 @@ def detect(frame, blue_sat=165, peak_relative=.55, min_distance=9,
         masks = trained_colour_masks(frame, colour_model)
     else:
         masks = colour_masks(hsv, blue_sat)
+    if active_colours is not None:
+        requested = tuple(active_colours)
+        invalid = [colour for colour in requested if colour not in COLOURS]
+        if invalid:
+            raise ValueError(f'Unknown active colours: {invalid}')
+        masks = {colour: masks[colour] for colour in requested}
+        if not masks:
+            raise ValueError('active_colours must not be empty')
     brightness = cv2.GaussianBlur(hsv[:, :, 2], (3, 3), 0)
     targets, excluded = detect_targets(masks, scale)
     if extra_excluded is not None:
@@ -513,8 +525,16 @@ def detect(frame, blue_sat=165, peak_relative=.55, min_distance=9,
             if area > max_area_limit:
                 continue
             component = (labels[y:y+bh, x:x+bw] == label).astype(np.uint8) * 255
+            # Printed labels, coloured borders and reflections can have enough
+            # area but are only a stroke a few pixels thick.  A real gem must
+            # contain a compact colour core, not merely a long/thin component.
+            aspect = max(bw, bh) / max(1, min(bw, bh))
+            fill_ratio = area / max(1, bw * bh)
+            if aspect > 3.0 or fill_ratio < .22:
+                continue
             peaks = blob_centers(component, min_distance * scale, peak_relative,
                                  require_neck=area <= 300 * scale**2)
+            min_core_radius = max(2.5, 3.5 * scale)
             appearance_split = False
             # Check every eligible colour, without coordinates or a count
             # target. Require room for two minimum-size candidates.
@@ -525,6 +545,9 @@ def detect(frame, blue_sat=165, peak_relative=.55, min_distance=9,
                 if len(refined) > 1:
                     peaks = refined
                     appearance_split = True
+            peaks = [peak for peak in peaks if peak[0] >= min_core_radius]
+            if not peaks:
+                continue
             # Small touching gems may split too when their cores have a
             # clear neck. No target piece count is used anywhere.
             ambiguous = area > 300 * scale**2

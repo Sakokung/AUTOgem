@@ -1,13 +1,37 @@
 import unittest
 import time
+from unittest.mock import patch
 
 from auto_approach import (
-    FEEDBACK_DELAY_SECONDS, ApproachRunner, DirectionController, gem_in_gripper,
-    gripper_gem, match_target, plan_delivery_step, plan_step,
+    BACK_AWAY_PULSE_SECONDS, FEEDBACK_DELAY_SECONDS, ApproachRunner,
+    DirectionController, carried_gem_offset, carried_gem_position,
+    gem_in_gripper, gripper_gem, match_target, plan_delivery_step, plan_step,
 )
 
 
 class AutoApproachTests(unittest.TestCase):
+    def test_each_auto_start_resets_pickup_filter_to_green(self):
+        gem = {'colour': 'GREEN', 'x': 30, 'y': 20}
+        observation = {
+            'time': time.monotonic(), 'frame_index': 1,
+            'robot': {'x': 0, 'y': 0}, 'gems': [gem],
+            'gripper_gems': [],
+            'holes': {'GREEN': {'x': 100, 'y': 100, 'radius': 20}},
+            'target': gem,
+        }
+        selected_colours = []
+        runner = ApproachRunner(
+            lambda: observation, lambda packet: None, lambda: None,
+            lambda: True, select_colour=selected_colours.append)
+        runner.pickup_colour = 'CYAN'
+
+        with patch('auto_approach.threading.Thread') as thread:
+            runner.start()
+
+        self.assertEqual(selected_colours, ['GREEN'])
+        self.assertEqual(runner.state()['pickup_colour'], 'GREEN')
+        thread.assert_called_once_with(target=runner._run, daemon=True)
+
     def test_drive_pulse_returns_immediately_with_1_5_second_feedback_deadline(self):
         packets = []
         runner = ApproachRunner(
@@ -22,6 +46,20 @@ class AutoApproachTests(unittest.TestCase):
         self.assertLess(elapsed, .5)
         self.assertAlmostEqual(
             move_after - time.monotonic(), FEEDBACK_DELAY_SECONDS, delta=.1)
+
+    def test_long_drive_is_split_into_firmware_safe_pulses(self):
+        packets = []
+        stops = []
+        runner = ApproachRunner(
+            lambda: None, packets.append, lambda: stops.append(True),
+            lambda: True)
+
+        with patch.object(runner.cancel, 'wait', return_value=False):
+            runner._drive_pulse('B', 3.0)
+
+        self.assertEqual(packets, ['PB,500\n'] * 6)
+        self.assertEqual(stops, [True])
+        self.assertEqual(runner.state()['pulses'], 1)
 
     def test_feedback_delay_displays_fresh_distance_and_angle(self):
         runner = ApproachRunner(
@@ -76,16 +114,40 @@ class AutoApproachTests(unittest.TestCase):
         self.assertIsNone(match_target([inside], old_target))
         self.assertEqual(gripper_gem(robot, [inside]), inside)
 
-    def test_delivery_drops_only_when_tip_is_inside_hole(self):
+    def test_delivery_drops_only_when_tip_is_near_hole_centre(self):
         robot = {
             'x': 20, 'y': 50,
             'gripper_tip_x': 80, 'gripper_tip_y': 50,
             'marker_side_px': 20,
         }
         self.assertEqual(plan_delivery_step(
-            robot, {'x': 87, 'y': 50, 'radius': 20})[0], 'DROP')
+            robot, {'x': 83, 'y': 50, 'radius': 20})[0], 'DROP')
+        self.assertEqual(plan_delivery_step(
+            robot, {'x': 87, 'y': 50, 'radius': 20})[0], 'F')
         self.assertEqual(plan_delivery_step(
             robot, {'x': 150, 'y': 50, 'radius': 20})[0], 'F')
+
+    def test_delivery_centres_the_carried_gem_instead_of_gripper_tip(self):
+        robot = {
+            'x': 20, 'y': 50,
+            'gripper_tip_x': 80, 'gripper_tip_y': 50,
+            'marker_side_px': 20,
+        }
+        gem = {'colour': 'RED', 'x': 85, 'y': 53}
+        offset = carried_gem_offset(robot, gem)
+        projected = carried_gem_position(robot, offset)
+
+        self.assertAlmostEqual(projected['x'], gem['x'])
+        self.assertAlmostEqual(projected['y'], gem['y'])
+        self.assertEqual(plan_delivery_step(
+            robot, {'x': 85, 'y': 53, 'radius': 20},
+            carried_gem=projected)[0], 'DROP')
+        self.assertNotEqual(plan_delivery_step(
+            robot, {'x': 80, 'y': 50, 'radius': 20},
+            carried_gem=projected)[0], 'DROP')
+
+    def test_back_away_pulse_is_long_enough_to_clear_the_hole(self):
+        self.assertEqual(BACK_AWAY_PULSE_SECONDS, 3.0)
 
     def test_delivery_prioritizes_distance_for_far_angled_hole(self):
         robot = {
@@ -261,8 +323,46 @@ class AutoApproachTests(unittest.TestCase):
         runner.running = True
         runner._run()
 
-        self.assertEqual(packets, ['O', 'C', 'O', 'PB,60\n'])
+        self.assertEqual(packets, ['O', 'C', 'O', 'PB,3000\n'])
         self.assertIn('วางหินในวงสี RED แล้ว', runner.state()['message'])
+
+    def test_green_drop_advances_pickup_filter_to_cyan(self):
+        robot = {
+            'x': 20, 'y': 50, 'heading_deg': 0,
+            'gripper_tip_x': 80, 'gripper_tip_y': 50,
+            'marker_side_px': 20,
+        }
+        gem = {'colour': 'GREEN', 'x': 82, 'y': 51}
+        frame_index = 0
+        selected_colours = []
+        runner = None
+
+        def snapshot():
+            nonlocal frame_index
+            frame_index += 1
+            return {
+                'time': time.monotonic(), 'frame_index': frame_index,
+                'robot': robot, 'gems': [gem], 'gripper_gems': [gem],
+                'holes': {'GREEN': {'x': 82, 'y': 51, 'radius': 20}},
+                'target': gem,
+            }
+
+        runner = ApproachRunner(
+            snapshot, lambda packet: None, lambda: None, lambda: True,
+            select_colour=selected_colours.append)
+
+        def back_away(command, duration):
+            runner.cancel.set()
+            return time.monotonic()
+
+        runner._drive_pulse = back_away
+        runner.target = dict(gem)
+        runner.running = True
+        runner._run()
+
+        self.assertEqual(selected_colours, ['CYAN'])
+        self.assertEqual(runner.state()['pickup_colour'], 'CYAN')
+        self.assertIn('รอหินสี CYAN', runner.state()['message'])
 
     def test_auto_closes_for_a_different_gem_seen_inside_gripper(self):
         robot = {
@@ -305,7 +405,7 @@ class AutoApproachTests(unittest.TestCase):
         runner.running = True
         runner._run()
 
-        self.assertEqual(packets, ['O', 'C', 'O', 'PB,60\n'])
+        self.assertEqual(packets, ['O', 'C', 'O', 'PB,3000\n'])
         self.assertIn('BLUE', guides)
         self.assertEqual(guides[-1], None)
         self.assertIn('วงสี BLUE', runner.state()['message'])
@@ -336,16 +436,19 @@ class AutoApproachTests(unittest.TestCase):
 
         def send(packet):
             packets.append(packet)
-            if packets == ['O', 'C', 'O', 'PB,60\n']:
-                runner.cancel.set()
 
         runner = ApproachRunner(snapshot, send, lambda: None, lambda: True,
                                 guides.append)
+        def back_away(command, duration):
+            packets.append(f'P{command},{round(duration*1000)}\n')
+            runner.cancel.set()
+            return time.monotonic()
+        runner._drive_pulse = back_away
         runner.target = dict(gem)
         runner.running = True
         runner._run()
 
-        self.assertEqual(packets, ['O', 'C', 'O', 'PB,60\n'])
+        self.assertEqual(packets, ['O', 'C', 'O', 'PB,3000\n'])
         self.assertEqual(packets.count('O'), 2)
         self.assertIn('RED', guides)
         self.assertEqual(guides[-1], None)

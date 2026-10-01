@@ -1,7 +1,7 @@
 {
   "version": 1,
   "colour_space": "HSV",
-  "reference_width": 1200,
+  "reference_width": 640,
   "colours": {
     "BLUE": {
       "h_center": 99,
@@ -15,34 +15,34 @@
       "morph_kernel": 3
     },
     "CYAN": {
-      "h_center": 95,
-      "h_tolerance": 16,
-      "s_center": 115,
-      "s_tolerance": 90,
-      "v_center": 195,
-      "v_tolerance": 70,
+      "h_center": 92,
+      "h_tolerance": 11,
+      "s_center": 69,
+      "s_tolerance": 43,
+      "v_center": 234,
+      "v_tolerance": 48,
       "min_area": 55,
       "max_area": 4500,
       "morph_kernel": 3
     },
     "GREEN": {
-      "h_center": 60,
-      "h_tolerance": 18,
-      "s_center": 125,
-      "s_tolerance": 105,
-      "v_center": 165,
-      "v_tolerance": 100,
+      "h_center": 56,
+      "h_tolerance": 11,
+      "s_center": 59,
+      "s_tolerance": 48,
+      "v_center": 217,
+      "v_tolerance": 56,
       "min_area": 55,
       "max_area": 4500,
       "morph_kernel": 3
     },
     "PURPLE": {
-      "h_center": 145,
-      "h_tolerance": 18,
-      "s_center": 145,
-      "s_tolerance": 105,
-      "v_center": 130,
-      "v_tolerance": 115,
+      "h_center": 170,
+      "h_tolerance": 9,
+      "s_center": 75,
+      "s_tolerance": 38,
+      "v_center": 178,
+      "v_tolerance": 49,
       "min_area": 55,
       "max_area": 4500,
       "morph_kernel": 3

@@ -13,7 +13,18 @@ TURN_MIN_PULSE_SECONDS = .025
 TURN_MAX_PULSE_SECONDS = .055
 FORWARD_MIN_PULSE_SECONDS = .03
 FORWARD_MAX_PULSE_SECONDS = .10
-BACK_AWAY_PULSE_SECONDS = .06
+BACK_AWAY_PULSE_SECONDS = 3.0
+MAX_MOTOR_PULSE_SECONDS = .5
+DROP_CENTER_RADIUS_RATIO = .20
+DROP_CENTER_MIN_PX = 2.0
+DROP_CENTER_MAX_PX = 5.0
+AUTO_COLOUR_SEQUENCE = ('GREEN', 'CYAN')
+
+
+def target_copy(gem):
+    """Copy only the fields needed to navigate toward a detected stone."""
+    keys = ('colour', 'x', 'y')
+    return {key: gem[key] for key in keys if key in gem}
 
 
 def _scaled_pulse(error, near, far, minimum, maximum):
@@ -48,6 +59,42 @@ def gripper_gem(robot, gems):
     tip_x, tip_y = robot['gripper_tip_x'], robot['gripper_tip_y']
     return min(gems, key=lambda gem:
                (gem['x']-tip_x)**2 + (gem['y']-tip_y)**2)
+
+
+def carried_gem_offset(robot, gem):
+    """Store a held gem's tip-relative position in marker-scaled axes."""
+    x, y = robot['x'], robot['y']
+    tip_x, tip_y = robot['gripper_tip_x'], robot['gripper_tip_y']
+    fx, fy = tip_x-x, tip_y-y
+    forward = math.hypot(fx, fy)
+    marker_side = float(robot['marker_side_px'])
+    if forward < 8 or marker_side <= 0:
+        return None
+    ux, uy = fx/forward, fy/forward
+    rx, ry = -uy, ux
+    dx, dy = gem['x']-tip_x, gem['y']-tip_y
+    return ((dx*ux + dy*uy)/marker_side,
+            (dx*rx + dy*ry)/marker_side)
+
+
+def carried_gem_position(robot, offset):
+    """Project a remembered held-gem offset into the current camera frame."""
+    if offset is None:
+        return None
+    x, y = robot['x'], robot['y']
+    tip_x, tip_y = robot['gripper_tip_x'], robot['gripper_tip_y']
+    fx, fy = tip_x-x, tip_y-y
+    forward = math.hypot(fx, fy)
+    marker_side = float(robot['marker_side_px'])
+    if forward < 8 or marker_side <= 0:
+        return None
+    ux, uy = fx/forward, fy/forward
+    rx, ry = -uy, ux
+    along, lateral = offset
+    return {
+        'x': tip_x + marker_side*(along*ux + lateral*rx),
+        'y': tip_y + marker_side*(along*uy + lateral*ry),
+    }
 
 
 def gem_in_gripper(robot, gem, max_tip_distance_scale=.72,
@@ -143,35 +190,51 @@ class DirectionController:
         return result
 
 
-def plan_delivery_step(robot, hole, direction=None):
-    """Approach a colour hole distance-first, then request a drop."""
-    destination = {'x': hole['x'], 'y': hole['y']}
+def plan_delivery_step(robot, hole, direction=None, carried_gem=None):
+    """Centre the held gem on its colour hole, then request a drop."""
+    tip_x, tip_y = robot['gripper_tip_x'], robot['gripper_tip_y']
+    carried_x = tip_x if carried_gem is None else carried_gem['x']
+    carried_y = tip_y if carried_gem is None else carried_gem['y']
+    # Guide the gripper tip to a compensated point so that an off-centre gem
+    # between the jaws, rather than the gripper tip itself, reaches the centre.
+    destination = {
+        'x': hole['x']-(carried_x-tip_x),
+        'y': hole['y']-(carried_y-tip_y),
+    }
     direction = direction or DirectionController()
     command, duration, distance, angle = direction.plan(robot, destination)
-    drop_distance = max(12.0, .55 * float(hole['radius']))
+    drop_distance = max(
+        DROP_CENTER_MIN_PX,
+        min(DROP_CENTER_MAX_PX,
+            DROP_CENTER_RADIUS_RATIO*float(hole['radius'])))
     if distance <= drop_distance:
         return 'DROP', 0, distance, angle
     return command, duration, distance, angle
 
 
 class ApproachRunner:
-    def __init__(self, snapshot, send, stop, ready, guide=None):
+    def __init__(self, snapshot, send, stop, ready, guide=None,
+                 select_colour=None):
         self.snapshot = snapshot
         self.send = send
         self.stop_motors = stop
         self.ready = ready
         self.guide = guide or (lambda colour: None)
+        self.select_colour = select_colour or (lambda colour: None)
         self.lock = threading.RLock()
         self.cancel = threading.Event()
         self.running = False
         self.message = 'ยังไม่เริ่ม'
         self.pulses = 0
         self.target = None
+        self.carried_offset = None
+        self.pickup_colour = AUTO_COLOUR_SEQUENCE[0]
 
     def state(self):
         with self.lock:
             return dict(running=self.running, message=self.message,
-                        pulses=self.pulses, target=self.target)
+                        pulses=self.pulses, target=self.target,
+                        pickup_colour=self.pickup_colour)
 
     def _message(self, value):
         with self.lock:
@@ -183,16 +246,31 @@ class ApproachRunner:
                 raise ValueError('รถกำลังวิ่งไปหาเป้าหมายอยู่')
             if not self.ready():
                 raise ValueError('ต้องเปิดกล้องจริง อยู่แท็บควบคุมรถ และปิดการควบคุมด้วยปุ่ม')
+            # Every new Auto run starts from GREEN, even if a previous run had
+            # already advanced to CYAN.  Changing the vision filter can
+            # invalidate its latest observation, so allow the camera worker a
+            # short time to publish a fresh GREEN-only frame.
+            self.pickup_colour = AUTO_COLOUR_SEQUENCE[0]
+            self.select_colour(self.pickup_colour)
+            deadline = time.monotonic() + 1.0
             observation = self.snapshot()
+            while (self.ready() and time.monotonic() < deadline
+                   and (observation is None
+                        or observation.get('target') is None
+                        or observation['target'].get('colour')
+                        != self.pickup_colour)):
+                time.sleep(.025)
+                observation = self.snapshot()
             if (observation is None or observation['robot'] is None
                     or observation['target'] is None
+                    or observation['target']['colour'] != self.pickup_colour
                     or time.monotonic()-observation['time'] > .8):
-                raise ValueError('ยังไม่พบ ArUco ID 0 คันเดียวและหินเป้าหมายในภาพล่าสุด')
+                raise ValueError(
+                    f'ยังไม่พบ ArUco ID 0 คันเดียวและหินสี {self.pickup_colour} ในภาพล่าสุด')
             target_colour = observation['target']['colour']
             if target_colour not in observation.get('holes', {}):
                 raise ValueError(f'ยังไม่ได้ตั้งวงรับหินสี {target_colour}')
-            self.target = {key: observation['target'][key]
-                           for key in ('colour', 'x', 'y')}
+            self.target = target_copy(observation['target'])
             self.running = True
             self.pulses = 0
             self.message = 'กำลังยืนยันหินเป้าหมาย'
@@ -219,13 +297,20 @@ class ApproachRunner:
 
     def _drive_pulse(self, command, duration):
         """Request one small firmware-timed pulse and return the next-move time."""
-        milliseconds = max(20, min(500, round(duration*1000)))
-        if not self._send_continuous(f'P{command},{milliseconds}\n'):
-            return None
         self.pulses += 1
-        if self.cancel.wait(duration):
-            self.stop_motors()
-            return None
+        # Firmware accepts at most 500 ms per timed command.  Split longer
+        # movements (such as backing away after a drop) into safe pulses while
+        # retaining cancellation and the firmware's automatic stop safeguard.
+        remaining = duration
+        while remaining > 0:
+            chunk = min(MAX_MOTOR_PULSE_SECONDS, remaining)
+            milliseconds = max(20, round(chunk*1000))
+            if not self._send_continuous(f'P{command},{milliseconds}\n'):
+                return None
+            if self.cancel.wait(milliseconds/1000):
+                self.stop_motors()
+                return None
+            remaining -= chunk
         # This redundant stop is fail-safe; normal pulse timing is local to ESP32.
         self.stop_motors()
         return time.monotonic() + FEEDBACK_DELAY_SECONDS
@@ -283,9 +368,10 @@ class ApproachRunner:
                     continue
                 if self.target is None:
                     candidate = observation.get('target')
-                    if candidate is None:
+                    if (candidate is None
+                            or candidate['colour'] != self.pickup_colour):
                         self.stop_motors()
-                        self._message('รอหินก้อนถัดไป')
+                        self._message(f'รอหินสี {self.pickup_colour} ก้อนถัดไป')
                         self.cancel.wait(.10)
                         continue
                     if candidate['colour'] not in observation.get('holes', {}):
@@ -293,8 +379,7 @@ class ApproachRunner:
                         self._message(f'รอการตั้งวงรับหินสี {candidate["colour"]}')
                         self.cancel.wait(.25)
                         continue
-                    self.target = {key: candidate[key]
-                                   for key in ('colour', 'x', 'y')}
+                    self.target = target_copy(candidate)
                     stable = 0
                     capture_frames = 0
                     previous_pose = None
@@ -310,10 +395,11 @@ class ApproachRunner:
                     # detections are not evidence that it was dropped.
                     carried = gripper_gem(
                         robot, observation.get('gripper_gems', []))
+                    if carried is not None:
+                        self.carried_offset = carried_gem_offset(robot, carried)
                     if (carried is not None
                             and carried['colour'] != self.target['colour']):
-                        self.target = {key: carried[key]
-                                       for key in ('colour', 'x', 'y')}
+                        self.target = target_copy(carried)
                         self.guide(self.target['colour'])
                     hole = observation.get('holes', {}).get(self.target['colour'])
                     if hole is None:
@@ -321,8 +407,10 @@ class ApproachRunner:
                         self._message(f'รอวงรับหินสี {self.target["colour"]}')
                         self.cancel.wait(.25)
                         continue
+                    carried_position = carried_gem_position(
+                        robot, self.carried_offset)
                     command, duration, distance, angle = plan_delivery_step(
-                        robot, hole, direction)
+                        robot, hole, direction, carried_position)
                     if self._show_feedback_delay(
                             next_move_at, command, distance, angle,
                             f'พาหินไปวง {self.target["colour"]}'):
@@ -356,7 +444,8 @@ class ApproachRunner:
                         self._message(f'ถึงวงสี {self.target["colour"]}; กำลังปล่อยหิน')
                         if not self._send_continuous('O'):
                             return
-                        self.cancel.wait(.7)
+                        if self.cancel.wait(.7):
+                            return
                         completed_colour = self.target['colour']
                         self._message(
                             f'วางหินสี {completed_colour} แล้ว; กำลังถอยออกจากวง')
@@ -365,7 +454,11 @@ class ApproachRunner:
                         if next_move_at is None:
                             return
                         self.target = None
+                        self.carried_offset = None
                         self.guide(None)
+                        if completed_colour == AUTO_COLOUR_SEQUENCE[0]:
+                            self.pickup_colour = AUTO_COLOUR_SEQUENCE[1]
+                        self.select_colour(self.pickup_colour)
                         phase = 'pickup'
                         stable = 0
                         capture_frames = 0
@@ -375,7 +468,8 @@ class ApproachRunner:
                         no_progress = 0
                         direction.reset()
                         self._message(
-                            f'วางหินในวงสี {completed_colour} แล้ว; รอหินก้อนถัดไป')
+                            f'วางหินในวงสี {completed_colour} แล้ว; '
+                            f'รอหินสี {self.pickup_colour} ก้อนถัดไป')
                         continue
                     self._message(
                         f'พาหินไปวง {self.target["colour"]}: {command} | '
@@ -394,7 +488,7 @@ class ApproachRunner:
                     gem = self.target
                     self._message('มองไม่เห็นเป้าหมาย; ไปยังพิกัดล่าสุดต่อ')
                 else:
-                    self.target = {key: gem[key] for key in ('colour', 'x', 'y')}
+                    self.target = target_copy(gem)
                 # The jaw ROI is stronger evidence than the old target lock:
                 # close for any stone actually seen between the gripper arms.
                 captured_gem = gripper_gem(
@@ -437,14 +531,16 @@ class ApproachRunner:
                 if command == 'GRIP':
                     # Deliver according to the stone that is physically in the
                     # gripper, even if it differs from the earlier visual lock.
-                    self.target = {key: captured_gem[key]
-                                   for key in ('colour', 'x', 'y')}
+                    self.target = target_copy(captured_gem)
+                    self.carried_offset = carried_gem_offset(
+                        robot, captured_gem)
                     self.guide(self.target['colour'])
                     self.stop_motors()
                     self._message(f'พบหินในกริปเปอร์ {distance:.0f} px; กำลังคีบ')
                     if not self._send_continuous('C'):
                         return
-                    self.cancel.wait(.7)
+                    if self.cancel.wait(.7):
+                        return
                     self._message(f'คีบหินแล้ว; กำลังไปวงสี {self.target["colour"]}')
                     phase = 'deliver'
                     direction.reset()

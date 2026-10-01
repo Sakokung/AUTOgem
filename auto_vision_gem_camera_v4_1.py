@@ -22,9 +22,8 @@ from auto_vision_gem_colors_v4_1 import (
 )
 
 
-# Auto sorting works through the whole field one colour at a time.  The route
-# cost is used only to choose the best stone within the current colour.
-AUTO_COLOUR_ORDER = ("CYAN", "GREEN", "PURPLE", "RED", "ORANGE", "BLUE")
+# The live controller activates one entry at a time: GREEN first, then CYAN.
+AUTO_COLOUR_ORDER = ("GREEN", "CYAN")
 
 
 def local_to_image(center, forward, right, marker_side, local_points):
@@ -97,10 +96,10 @@ def detect_aruco(frame, rear_scale=1.35, body_front_scale=1.55,
             center_f, forward, right, marker_side, gripper_local)
         cv2.fillPoly(car_mask, [body_polygon, gripper_polygon], 255)
         gripper_capture_local = [
-            (1.70, -.55),
-            (3.45, -.55),
-            (3.45, .55),
-            (1.70, .55),
+            (1.45, -.75),
+            (3.75, -.75),
+            (3.75, .75),
+            (1.45, .75),
         ]
         gripper_capture_polygon = local_to_image(
             center_f, forward, right, marker_side, gripper_capture_local)
@@ -219,6 +218,9 @@ def choose_nearest_target(markers, gems, robot_id=0,
         return None
     robot = robots[0]
     priorities = {colour: index for index, colour in enumerate(colour_order)}
+    gems = [item for item in gems if item['colour'] in priorities]
+    if not gems:
+        return None
     first_priority = min(priorities.get(item['colour'], len(priorities))
                          for item in gems)
     current_colour_gems = [

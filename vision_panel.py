@@ -23,6 +23,7 @@ from hsv_calibrator_v4_1 import default_config, hue_distance
 KEYS = ('h_center', 'h_tolerance', 's_center', 's_tolerance',
         'v_center', 'v_tolerance', 'min_area', 'max_area', 'morph_kernel')
 LIMITS = (179, 89, 255, 255, 255, 255, 2000, 20000, 15)
+INITIAL_AUTO_COLOUR = 'GREEN'
 
 
 def atomic_json(path, data):
@@ -70,6 +71,17 @@ def pixel(point, shape):
     return (round(point[0] * (w - 1)), round(point[1] * (h - 1)))
 
 
+def occupied_hole_colours(gems, holes):
+    """Return colours whose matching stone centre is inside its circle."""
+    return {
+        colour for colour, hole in holes.items()
+        if any(gem['colour'] == colour
+               and (gem['x']-hole['x'])**2 + (gem['y']-hole['y'])**2
+               <= float(hole['radius'])**2
+               for gem in gems)
+    }
+
+
 class VisionPanel:
     def __init__(self, config_path, field_path):
         self.lock = threading.RLock()
@@ -88,8 +100,10 @@ class VisionPanel:
         self.dirty = False
         self.frame_index = 0
         self.last_preview = None
+        self.last_colour_mask = None
         self.observation = None
         self.delivery_colour = None
+        self.auto_colour = INITIAL_AUTO_COLOUR
         if self.config_path.exists():
             self.config = valid_config(json.loads(self.config_path.read_text(encoding='utf-8-sig')))
             self.saved_config = copy.deepcopy(self.config)
@@ -122,6 +136,7 @@ class VisionPanel:
             raise ValueError('โหมดไม่ถูกต้อง')
         with self.lock:
             self.mode = mode
+            self.last_colour_mask = None
             self.hole_pending = None
             if mode != 'view':
                 self.observation = None
@@ -136,6 +151,16 @@ class VisionPanel:
         with self.lock:
             self.delivery_colour = colour
 
+    def set_auto_colour(self, colour):
+        """Limit pickup detection to exactly one colour at a time."""
+        if colour not in COLOURS:
+            raise ValueError('Invalid Auto colour')
+        with self.lock:
+            if colour != self.auto_colour:
+                self.auto_colour = colour
+                # Never let Auto consume a target produced by the old filter.
+                self.observation = None
+
     def select(self, colour, hole=False):
         if colour not in COLOURS:
             raise ValueError('สีไม่ถูกต้อง')
@@ -145,6 +170,7 @@ class VisionPanel:
                 self.hole_pending = None
             else:
                 self.colour = colour
+                self.last_colour_mask = None
 
     def sliders(self, values):
         if not isinstance(values, dict) or set(values) != set(KEYS):
@@ -154,6 +180,7 @@ class VisionPanel:
             candidate['colours'][self.colour] = dict(values)
             valid_config(candidate)
             self.config = candidate
+            self.last_colour_mask = None
             self.dirty = True
 
     def undo(self):
@@ -166,12 +193,14 @@ class VisionPanel:
                     self.config['colours'][self.colour] = copy.deepcopy(
                         self.saved_config['colours'][self.colour])
                 self.dirty = True
+                self.last_colour_mask = None
 
     def reset_colour(self):
         with self.lock:
             self.samples[self.colour].clear()
             self.config['colours'][self.colour] = copy.deepcopy(
                 default_config()['colours'][self.colour])
+            self.last_colour_mask = None
             self.dirty = True
 
     def save_colours(self):
@@ -213,6 +242,7 @@ class VisionPanel:
     def set_frame(self, frame, captured_at=None):
         with self.lock:
             self.frame = frame.copy()
+            self.last_colour_mask = None
             self.frame_captured_at = (time.monotonic() if captured_at is None
                                       else float(captured_at))
             self.frame_index += 1
@@ -266,6 +296,7 @@ class VisionPanel:
         self.dirty = True
 
     def _recompute(self, colour):
+        self.last_colour_mask = None
         pixels = np.concatenate(self.samples[colour], axis=0).astype(np.float32)
         angles = pixels[:, 0] * (2*np.pi/180)
         centre_h = round(np.arctan2(np.sin(angles).mean(),
@@ -291,38 +322,22 @@ class VisionPanel:
             if self.mode == 'colour':
                 self.observation = None
                 mask = configured_hsv_masks(frame, active_config)[self.colour]
+                self.last_colour_mask = mask
                 tint = np.zeros_like(frame)
                 tint[:] = DISPLAY_COLOURS[self.colour]
                 shown[mask > 0] = cv2.addWeighted(frame, .55, tint, .45, 0)[mask > 0]
             else:
+                self.last_colour_mask = None
                 # Same HSV detector used in the later run mode; this is a
                 # visual check only and never sends motion commands.
                 markers, car_mask = detect_aruco(frame)
-                _, gems, _, _ = detect(frame, hsv_config=active_config,
-                                       extra_excluded=car_mask)
-                polygon = (np.array([pixel(p, frame.shape) for p in self.field['arena']],
-                                    np.int32) if len(self.field['arena']) == 4 else None)
-                available_gems = []
-                for gem in gems:
-                    x, y = gem['x'], gem['y']
-                    if polygon is not None and cv2.pointPolygonTest(polygon, (x, y), False) < 0:
-                        continue
-                    if self._inside_hole((x, y), frame.shape):
-                        continue
-                    available_gems.append(gem)
-                    c = DISPLAY_COLOURS[gem['colour']]
-                    cv2.circle(shown, (x, y), 7, c, 2)
-                    cv2.putText(shown, gem['colour'][0], (x+8, y-8),
-                                cv2.FONT_HERSHEY_SIMPLEX, .45, c, 2, cv2.LINE_AA)
+                _, gems, _, _ = detect(
+                    frame, hsv_config=active_config,
+                    extra_excluded=car_mask,
+                    active_colours=(self.auto_colour,))
                 matching_robots = [marker for marker in markers
                                    if marker['aruco_id'] == 0]
                 robot = matching_robots[0] if len(matching_robots) == 1 else None
-                gripper_gems = []
-                if robot is not None:
-                    capture = robot['gripper_capture_polygon']
-                    gripper_gems = [gem for gem in available_gems
-                                    if cv2.pointPolygonTest(
-                                        capture, (gem['x'], gem['y']), False) >= 0]
                 holes = {}
                 for colour, hole in self.field['holes'].items():
                     centre = pixel(hole['center'], frame.shape)
@@ -332,6 +347,29 @@ class VisionPanel:
                         'radius': float(np.hypot(edge[0]-centre[0],
                                                  edge[1]-centre[1])),
                     }
+                occupied_colours = occupied_hole_colours(gems, holes)
+                polygon = (np.array([pixel(p, frame.shape) for p in self.field['arena']],
+                                    np.int32) if len(self.field['arena']) == 4 else None)
+                available_gems = []
+                for gem in gems:
+                    x, y = gem['x'], gem['y']
+                    if polygon is not None and cv2.pointPolygonTest(polygon, (x, y), False) < 0:
+                        continue
+                    if self._inside_hole((x, y), frame.shape):
+                        continue
+                    if gem['colour'] in occupied_colours:
+                        continue
+                    available_gems.append(gem)
+                    c = DISPLAY_COLOURS[gem['colour']]
+                    cv2.circle(shown, (x, y), 7, c, 2)
+                    cv2.putText(shown, gem['colour'][0], (x+8, y-8),
+                                cv2.FONT_HERSHEY_SIMPLEX, .45, c, 2, cv2.LINE_AA)
+                gripper_gems = []
+                if robot is not None:
+                    capture = robot['gripper_capture_polygon']
+                    gripper_gems = [gem for gem in available_gems
+                                    if cv2.pointPolygonTest(
+                                        capture, (gem['x'], gem['y']), False) >= 0]
                 for marker in markers:
                     cv2.polylines(shown, [marker['corners'].reshape(-1, 1, 2)],
                                   True, (0, 255, 0), 2)
@@ -360,7 +398,8 @@ class VisionPanel:
                                 cv2.LINE_AA)
                 selected = (None if self.delivery_colour is not None else
                             choose_nearest_target(markers, available_gems,
-                                                  robot_id=0))
+                                                  robot_id=0,
+                                                  colour_order=(self.auto_colour,)))
                 self.observation = {
                     'time': time.monotonic(), 'frame_index': self.frame_index,
                     'captured_at': self.frame_captured_at,
@@ -411,6 +450,10 @@ class VisionPanel:
         with self.lock:
             if self.mode != 'colour' or self.frame is None:
                 return None
+            # field_worker calls render() first, so reuse its mask instead of
+            # repeating the most expensive full-frame operation.
+            if self.last_colour_mask is not None:
+                return self.last_colour_mask
             return configured_hsv_masks(self.frame, self.config)[self.colour]
 
     def _inside_hole(self, point, shape):
